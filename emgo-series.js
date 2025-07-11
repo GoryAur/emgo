@@ -1,6 +1,4 @@
-#!/usr/bin/env node
-
-require('dotenv').config()
+require('dotenv').config();
 const fs = require('fs-extra');
 const path = require('path');
 const axios = require('axios');
@@ -9,25 +7,24 @@ const { program } = require('commander');
 program
   .option('-s, --source <path>', 'Directorio fuente', '/mnt/torrents/shows/')
   .option('-d, --dest <path>', 'Directorio destino', '/media/tvshows/')
-  .option('--delay <ms>', 'Retraso entre peticiones (ms)', '1000')
+  .option('--delay <ms>', 'Retraso base entre peticiones (ms)', '2000')
   .option('--dry-run', 'Simular sin crear symlinks')
   .option('--lang <code>', 'Idioma TMDb', 'en-US')
   .option('--clear-cache', 'Borrar caché antes de empezar')
   .parse(process.argv);
 
 const options = program.opts();
-
-const TMDB_API_KEY = process.env.TMDB_API_KEY;
-const OMDB_API_KEY = process.env.OMDB_API_KEY;
+const TMDB_API_KEY = process.env.TMDB_API_KEY || process.env.TMDB_API_KEY2;
+const OMDB_API_KEY = process.env.TMDB_API_KEY || process.env.OMDB_API_KEY2;
 const LANGUAGE = options.lang;
 const DELAY = parseInt(options.delay, 10);
 const DRY_RUN = !!options.dryRun;
 const CACHE_FILE = '.symlinked-series.json';
 
-const allKeywordsRegex = /\b(2160p|1080p|720p|480p|HDR|WEB[- ]?DL|WEBRIP|BLURAY|REMUX|HDTV|X264|X265|AAC|AC3|DTS|FLAC|HEVC|10bit|H\.?264|265|DDP|ATMOS|mRs|MrTentsaw|ani|batch|tv|AMZN)\b/gi;
 const videoExtensions = /\.(mkv|mp4|avi|mov|wmv|flv|m4v)$/i;
 const seasonEpisodeRegex = /S(\d{1,2})E(\d{2})(?:[-]?E?(\d{2}))?|(\\d{1,2})x(\\d{2})(?:x(\\d{2}))?|(?:(\d{1})(\d{2})(?:[-_ ](\d{2})))?/i;
-
+const yearRegex = /\b(19|20)\d{2}\b/;
+const allKeywordsRegex = /\b(2160p|1080p|720p|480p|HDR|WEB[- ]?DL|WEBRIP|BLURAY|REMUX|HDTV|X264|X265|AAC|AC3|DTS|FLAC|HEVC|10bit|H\.?264|265|DDP|ATMOS|mRs|MrTentsaw|ani|batch|tv|AMZN)\b/gi;
 const cleaningRegexes = [
   /\(\d{4}\)/g,                                // años (2009)
   /\bSeason\s?\d{1,3}\b/gi,                    // Season 1, Season 27
@@ -40,32 +37,23 @@ const cleaningRegexes = [
 ];
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
-
-async function findVideoFiles(dir) {
-  const entries = await fs.readdir(dir, { withFileTypes: true });
-  const files = [];
-  for (const entry of entries) {
-    const fullPath = path.join(dir, entry.name);
-    if (entry.isDirectory()) {
-      const nested = await findVideoFiles(fullPath);
-      files.push(...nested);
-    } else if (entry.isFile() && videoExtensions.test(entry.name)) {
-      files.push(fullPath);
-    }
-  }
-  return files;
-}
+const randomDelay = () => sleep(DELAY + Math.floor(Math.random() * 2000));
 
 function cleanTitle(str) {
   let result = str;
-  for (const rx of cleaningRegexes) {
-    result = result.replace(rx, ' ');
-  }
+  for (const rx of cleaningRegexes) result = result.replace(rx, ' ');
   return result.trim();
 }
 
-function parseFileName(filename) {
-  const name = path.parse(filename).name.replace(/[\._]/g, ' ');
+function extractDescriptors(...sources) {
+  const all = sources.join(' ').match(allKeywordsRegex);
+  return all ? [...new Set(all.map(d => d.toUpperCase()))].join(' ') : '';
+}
+
+function parseFileName(filePath) {
+  const fileName = path.parse(filePath).name.replace(/[_\.]/g, ' ');
+  const folderName = path.basename(path.dirname(filePath)).replace(/[_\.]/g, ' ');
+  const name = fileName;
 
   const regexes = [
     /S(?<season>\d{1,2})E(?<start>\d{2})(?:E(?<extra>\d{2}))*?(?:-E?(?<end>\d{2}))?/i,
@@ -73,49 +61,32 @@ function parseFileName(filename) {
     /(?<season>\d)(?<start>\d{2})(?:[-_ ](?<end>\d{2}))?/i
   ];
 
-  let season = null;
-  let episodes = [];
-
   let match;
   for (const regex of regexes) {
     match = name.match(regex);
     if (match) break;
   }
+  if (!match?.groups?.season || !match?.groups?.start) return null;
 
-  if (!match || !match.groups || !match.groups.season || !match.groups.start) {
-    console.warn(`⚠️ No se pudo determinar temporada/episodio de: ${path.basename(filename)}`);
-    return null;
-  }
-
-  season = parseInt(match.groups.season);
-  if (season === 0) {
-  console.warn(`⏭️ Ignorado por ser temporada 0 (extra): ${path.basename(filename)}`);
-  return null;
-  }
+  const season = parseInt(match.groups.season);
+  if (season === 0) return null;
 
   const startEp = parseInt(match.groups.start);
+  let episodes = [startEp];
 
   if (match.groups.end) {
     const endEp = parseInt(match.groups.end);
     if (endEp > startEp && endEp - startEp <= 20) {
-      for (let ep = startEp; ep <= endEp; ep++) {
-        episodes.push(ep);
-      }
-    } else {
-      episodes = [startEp];
+      episodes = [];
+      for (let ep = startEp; ep <= endEp; ep++) episodes.push(ep);
     }
-  } else {
-    episodes = [startEp];
-    if (match.groups.extra) {
-      const extra = parseInt(match.groups.extra);
-      if (!isNaN(extra)) episodes.push(extra);
-    }
-
-    const extraEs = [...name.matchAll(/E(\d{2})/gi)].map(m => parseInt(m[1]));
-    if (extraEs.length > 1) {
-      episodes = Array.from(new Set(extraEs));
-    }
+  } else if (match.groups.extra) {
+    const extra = parseInt(match.groups.extra);
+    if (!isNaN(extra)) episodes.push(extra);
   }
+
+  const extras = [...name.matchAll(/E(\d{2})/gi)].map(m => parseInt(m[1]));
+  if (extras.length > 1) episodes = Array.from(new Set(extras));
 
   const seasonStr = String(season).padStart(2, '0');
   episodes = episodes.map(e => String(e).padStart(2, '0'));
@@ -126,7 +97,6 @@ function parseFileName(filename) {
 
   // 🛠️ Fallback en caso de que no haya título detectado
   if (!titleBeforeSE) {
-  const folderName = path.basename(path.dirname(filename)).replace(/[\._]/g, ' ');
 
   titleBeforeSE = folderName
     .replace(/season\s?\d+/i, '')
@@ -136,8 +106,6 @@ function parseFileName(filename) {
     .replace(/\s{2,}/g, ' ')
     .trim();
   }
-
-
   const descriptors = name.match(allKeywordsRegex);
   const uniqueDescriptors = descriptors
     ? [...new Set(descriptors.map(d => d.toUpperCase()))].join(' ')
@@ -151,6 +119,52 @@ function parseFileName(filename) {
   };
 }
 
+async function loadJSON(file) {
+  try { return await fs.readJSON(file); } catch { return {}; }
+}
+
+async function saveJSON(file, data) {
+  try { await fs.writeJSON(file, data, { spaces: 2 }); } catch (e) { console.error(`❌ Error guardando ${file}:`, e.message); }
+}
+
+async function fetchSeries(query, year, tmdbCache) {
+  const key = `${query.toLowerCase()}|${year || ''}`;
+  if (tmdbCache[key]) return tmdbCache[key];
+
+  try {
+    const res = await axios.get('https://api.themoviedb.org/3/search/tv', {
+      params: { api_key: TMDB_API_KEY, query, language: LANGUAGE, first_air_date_year: year },
+      headers: { 'User-Agent': 'EmbySymlink/1.0' }
+    });
+    if (res.data.results.length) {
+      const best = res.data.results.find(r => r.first_air_date?.startsWith(String(year))) || res.data.results[0];
+      tmdbCache[key] = best;
+      await saveJSON(CACHE_FILE, tmdbCache);
+      return best;
+    }
+  } catch (e) {
+    if (e.response?.status === 429) {
+      console.warn('⚠️ Rate limit alcanzado, esperando 10s...');
+      await sleep(10000);
+      return fetchSeries(query, year, tmdbCache);
+    }
+    console.warn(`❌ Error TMDb: ${query} - ${e.message}`);
+  }
+
+  try {
+    const omdbRes = await axios.get('http://www.omdbapi.com/', {
+      params: { t: query, type: 'series', apikey: OMDB_API_KEY, y: year }
+    });
+    if (omdbRes.data?.Response === 'True') {
+      const title = omdbRes.data.Title;
+      return fetchSeries(title, year, tmdbCache);
+    }
+  } catch (e) {
+    console.warn(`❌ Error OMDb: ${query} - ${e.message}`);
+  }
+
+  return null;
+}
 
 async function fetchSeriesFromTMDB(query, yearHint) {
   try {
@@ -199,39 +213,20 @@ async function fetchSeriesWithFallback(query) {
   return null;
 }
 
-async function loadCache() {
-  try {
-    const data = await fs.readFile(CACHE_FILE, 'utf8');
-    return JSON.parse(data);
-  } catch {
-    return {};
+async function findVideoFiles(dir) {
+  const entries = await fs.readdir(dir, { withFileTypes: true });
+  const files = [];
+  for (const entry of entries) {
+    const fullPath = path.join(dir, entry.name);
+    if (entry.isDirectory()) files.push(...await findVideoFiles(fullPath));
+    else if (entry.isFile() && videoExtensions.test(entry.name)) files.push(fullPath);
   }
+  return files;
 }
 
-async function saveCache(cache) {
-  try {
-    await fs.writeFile(CACHE_FILE, JSON.stringify(cache, null, 2), 'utf8');
-  } catch (e) {
-    console.error('❌ Error guardando caché', e.message);
-  }
-}
-
-async function clearCache() {
-  try {
-    await fs.unlink(CACHE_FILE);
-    console.log('🗑️ Caché borrada.');
-  } catch {}
-}
-
-async function createSymlink(filePath, tmdbCache, symlinkCache, destDir) {
+async function createSymlink(filePath, tmdbCache, linkCache, destDir) {
   const fileName = path.basename(filePath);
-  if (symlinkCache[fileName]) {
-    const dest = symlinkCache[fileName];
-    if (await fs.pathExists(dest)) {
-//      console.log(`⏭ Ya enlazado: ${fileName}`);
-      return;
-    }
-  }
+  if (linkCache[fileName] && await fs.pathExists(linkCache[fileName])) return;
 
   let parsed = parseFileName(fileName);
 
@@ -272,53 +267,42 @@ async function createSymlink(filePath, tmdbCache, symlinkCache, destDir) {
   }
 
   const showTitle = show.name || rawTitle;
-  const year = show.first_air_date?.split('-')[0] || '0000';
-  const baseFolder = path.join(destDir, `${showTitle} (${year})`, `Season ${parseInt(season)}`);
-
+  const showYear = show.first_air_date?.split('-')[0] || yearHint || '0000';
+  const baseFolder = path.join(destDir, `${showTitle} (${showYear})`, `Season ${parseInt(season)}`);
   await fs.ensureDir(baseFolder);
 
   for (const episode of episodes) {
     const destFile = path.join(
       baseFolder,
-      `${showTitle} S${season}E${episode}${descriptors ? ` - ${descriptors}` : ''}${path.extname(filePath)}`
+      `${showTitle} S${season}E${episode}${descriptors ? ' - ' + descriptors : ''}${path.extname(filePath)}`
     );
+    if (await fs.pathExists(destFile)) continue;
 
-    if (await fs.pathExists(destFile)) {
-//      console.log(`⏭ Ya existe: ${destFile}`);
-      continue;
-    }
-
-    if (DRY_RUN) {
-      console.log(`[Dry Run] ➤ ${destFile}`);
-    } else {
+    if (DRY_RUN) console.log(`[Dry Run] ➤ ${destFile}`);
+    else {
       try {
         await fs.symlink(filePath, destFile);
         console.log(`✅ Symlink creado: ${destFile}`);
-        symlinkCache[fileName] = destFile;
-        await saveCache(symlinkCache);
+        linkCache[fileName] = destFile;
+        await saveJSON(CACHE_FILE, linkCache);
       } catch (e) {
         console.error(`❌ Error creando symlink: ${destFile} - ${e.message}`);
       }
     }
+    await randomDelay();
   }
 }
 
-
-async function main() {
-  if (options.clearCache) {
-    await clearCache();
-  }
-
+(async () => {
+  if (options.clearCache) await fs.remove(CACHE_FILE);
   const sourceDir = path.resolve(options.source);
   const destDir = path.resolve(options.dest);
 
   const files = await findVideoFiles(sourceDir);
-  const tmdbCache = {};
-  const symlinkCache = await loadCache();
+  const tmdbCache = await loadJSON(CACHE_FILE);
+  const linkCache = await loadJSON(CACHE_FILE);
 
   for (const filePath of files) {
-    await createSymlink(filePath, tmdbCache, symlinkCache, destDir);
+    await createSymlink(filePath, tmdbCache, linkCache, destDir);
   }
-}
-
-main();
+})();
