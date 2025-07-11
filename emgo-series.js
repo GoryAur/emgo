@@ -5,6 +5,7 @@ const axios = require('axios');
 const { program } = require('commander');
 
 program
+  .option('--fix-names', 'Renombrar symlinks/carpetas con ":" al estilo Radarr')
   .option('-s, --source <path>', 'Directorio fuente', '/mnt/torrents/shows/')
   .option('-d, --dest <path>', 'Directorio destino', '/media/tvshows/')
   .option('--delay <ms>', 'Retraso base entre peticiones (ms)', '2000')
@@ -293,6 +294,63 @@ async function createSymlink(filePath, tmdbCache, linkCache, destDir) {
   }
 }
 
+async function fixNames(destDir) {
+  console.log(`🔍 Escaneando symlinks y carpetas reales en: ${destDir}\n`);
+
+  const cachePath = path.join(destDir.includes('movies') ? '/media/movies' : '/media/tvshows', '.symlinked-series.json');
+  let linkCache = {};
+  try {
+    linkCache = await fs.readJSON(cachePath);
+  } catch {}
+
+  const updatedCache = {};
+
+  const items = await fs.readdir(destDir);
+  for (const item of items) {
+    if (!item.includes(':')) continue;
+
+    const oldPath = path.join(destDir, item);
+    const newName = item.replace(/: /g, ' - ').replace(/:/g, ' -');
+    const newPath = path.join(destDir, newName);
+
+    console.log(`🔁 Detectado con ':' → ${item}`);
+
+    if (oldPath === newPath) {
+      console.log(`   ❕ Ya está limpio, sin cambios.`);
+      continue;
+    }
+
+    if (await fs.pathExists(newPath)) {
+      console.log(`   ⚠️  No se puede renombrar, ya existe: ${newName}`);
+      continue;
+    }
+
+    try {
+      await fs.rename(oldPath, newPath);
+      console.log(`   ✅ Renombrado → ${newName}\n`);
+
+      // Actualiza claves en caché si coinciden con symlink exacto
+      for (const [originalName, targetPath] of Object.entries(linkCache)) {
+        if (targetPath === oldPath) {
+          updatedCache[originalName] = newPath;
+        } else {
+          updatedCache[originalName] = targetPath;
+        }
+      }
+    } catch (err) {
+      console.warn(`   ❌ Error al renombrar ${item}: ${err.message}`);
+    }
+  }
+
+  if (Object.keys(updatedCache).length > 0) {
+    await fs.writeJSON(cachePath, updatedCache, { spaces: 2 });
+    console.log(`💾 Caché actualizada con nuevos nombres.`);
+  }
+
+  console.log(`✅ Completado.\n`);
+}
+
+
 (async () => {
   if (options.clearCache) await fs.remove(CACHE_FILE);
   const sourceDir = path.resolve(options.source);
@@ -305,4 +363,10 @@ async function createSymlink(filePath, tmdbCache, linkCache, destDir) {
   for (const filePath of files) {
     await createSymlink(filePath, tmdbCache, linkCache, destDir);
   }
+
+  if (options.fixNames) {
+  await fixNames(path.resolve(options.dest));
+  process.exit(0);
+  }
+
 })();
